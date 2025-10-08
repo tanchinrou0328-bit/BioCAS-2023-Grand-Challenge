@@ -246,38 +246,56 @@ def train_model(
 
     return best_dict
 
-
 def calc_accuracy(output, Y, spike=False):
-    """Get batch accuracy of during training.
-    Args:
-        output: output obtained from model.
-        Y: actual/correct labels.
-        spike: True to use spiking output.
-    Returns:
-        train_acc: Training accuracy for that batch.
-    """
+    if isinstance(output, tuple):
+        output, _ = output
     if spike:
         train_acc = SF.acc.accuracy_rate(output[0], Y)
     else:
-        max_vals, max_indices = torch.max(output, 1)
-        train_acc = (max_indices == Y).sum().data.cpu().numpy() / max_indices.size()[0]
+        _, max_indices = torch.max(output, 1)
+        train_acc = (max_indices == Y).sum().item() / max_indices.size(0)
     return train_acc
 
 
 def calc_loss(criterion, output, Y, spike=False):
-    """Get batch loss of during training.
-    Args:
-        criterion: loss function.
-        output: output obtained from model.
-        Y: actual/correct labels.
-        spike: True to use spiking output.
-    Returns:
-        loss_fn(output, Y)
-    """
+    if isinstance(output, tuple):
+        output, _ = output
     if spike:
         return criterion(output[0], Y)
     else:
         return criterion(output, Y)
+
+# def calc_accuracy(output, Y, spike=False):
+#     """Get batch accuracy of during training.
+#     Args:
+#         output: output obtained from model.
+#         Y: actual/correct labels.
+#         spike: True to use spiking output.
+#     Returns:
+#         train_acc: Training accuracy for that batch.
+#     """
+#     if spike:
+#         train_acc = SF.acc.accuracy_rate(output[0], Y)
+#     else:
+#         max_vals, max_indices = torch.max(output, 1)
+#         train_acc = (max_indices == Y).sum().data.cpu().numpy() / max_indices.size()[0]
+#     return train_acc
+
+
+# def calc_loss(criterion, output, Y, spike=False):
+#     """Get batch loss of during training.
+#     Args:
+#         criterion: loss function.
+#         output: output obtained from model.
+#         Y: actual/correct labels.
+#         spike: True to use spiking output.
+#     Returns:
+#         loss_fn(output, Y)
+#     """
+#     if spike:
+#         return criterion(output[0], Y)
+#     else:
+#         return criterion(output, Y)
 
 
 def valid_model(device, task, dataloader, trained_model, verbose=False, spike=False):
@@ -461,3 +479,236 @@ def train_mixup(
         torch.save(best_dict, PATH)
 
     return best_dict
+
+def train_mixup_moe(
+    device,
+    task,
+    dataloader,
+    model,
+    criterion,
+    optimizer,
+    spike=False,
+    n_epochs=10,
+    print_every=1,
+    verbose=True,
+    plot_results=True,
+    validation=True,
+    save_ckpt=False,
+    model_name=None,
+    strategy=["score"],
+    use_moe=False,
+    aux_loss_weight=0.01,  # Weight for MoE load-balancing loss
+):
+    """
+    Training function with mixup augmentation and MoE support.
+    
+    Args:
+        device: either cpu or cuda for acceleration.
+        task: task identifier.
+        dataloader: dictionary with 'train' and optionally 'val' dataloaders.
+        model: model to train (can be PRS_classifier or PRS_classifier2 with MoE).
+        criterion: loss function for classification.
+        optimizer: optimizer for training.
+        spike: True to use spiking output (default: False).
+        n_epochs: number of training epochs.
+        print_every: print statistics every N epochs.
+        verbose: True to enable verbosity.
+        plot_results: True to plot training curves.
+        validation: True to perform validation.
+        save_ckpt: True to save checkpoints.
+        model_name: name for saving checkpoint.
+        strategy: list of metrics to track best model ('score', 'accuracy', 'loss').
+        use_moe: True if using MoE classifier (PRS_classifier2).
+        aux_loss_weight: weight for MoE load-balancing auxiliary loss.
+    
+    Returns:
+        best_dict: dictionary containing best model checkpoints for each strategy.
+    """
+    best_dict = {}
+    best_result = {}
+    for item in strategy:
+        best_result[item] = 0
+    losses = []
+    start = time.time()
+    print("\nTraining for {} epochs...".format(n_epochs))
+    
+    for epoch in range(n_epochs):
+        if verbose == True and epoch % print_every == 0:
+            print("\n\nEpoch {}/{}:".format(epoch + 1, n_epochs))
+
+        if validation == True:
+            evaluation = ["train", "val"]
+        else:
+            evaluation = ["train"]
+
+        # Each epoch has a training and validation phase
+        for phase in evaluation:
+            total = 0
+            correct = 0
+            running_loss = 0.0
+            running_aux_loss = 0.0  # Track auxiliary MoE loss separately
+            
+            if phase == "train":
+                model.train(True)  # Set model to training mode
+            else:
+                model.train(False)  # Set model to evaluate mode
+            
+            for data, label, info in dataloader[phase]:
+                data, label, info = data.to(device), label.to(device), info.to(device)
+
+                # Mix-up method
+                data, label_a, label_b, lam = mixup_data(data, label)
+                data, label_a, label_b = map(Variable, (data, label_a, label_b))
+                
+                # Forward pass
+                x = data
+                if use_moe:
+                    # MoE model returns outputs and auxiliary loss
+                    outputs, aux_loss = model(x)
+                else:
+                    # Standard model returns only outputs
+                    outputs = model(x)
+                    aux_loss = 0.0
+                
+                # Compute main classification loss with mixup
+                loss = mixup_criterion(criterion, outputs, label_a, label_b, lam)
+                
+                # Add auxiliary load-balancing loss for MoE
+                if use_moe:
+                    total_loss = loss + aux_loss_weight * aux_loss
+                    running_aux_loss += aux_loss.item()
+                else:
+                    total_loss = loss
+                
+                # Record loss statistics (moved here, only once)
+                running_loss += loss.item()
+                
+                # Calculate accuracy with mixup
+                _, predicted = torch.max(outputs.data, 1)
+                total += label.size(0)
+                correct += (lam * predicted.eq(label_a.data).cpu().sum().float()
+                    + (1 - lam) * predicted.eq(label_b.data).cpu().sum().float())
+                acc = 1.0 * correct / total
+
+                # Zero the parameter gradients
+                optimizer.zero_grad()
+
+                # Backward + optimize only if in training phase
+                if phase == "train":
+                    total_loss.backward()
+                    # Update the weights
+                    optimizer.step()
+
+            losses.append(running_loss)
+
+            if verbose == True and epoch % print_every == 0:
+                if use_moe:
+                    print(
+                        "{} loss: {:.4f} | aux_loss: {:.4f} | acc: {:.4f} |".format(
+                            phase, running_loss, running_aux_loss, acc
+                        ),
+                        end=" ",
+                    )
+                else:
+                    print(
+                        "{} loss: {:.4f} | acc: {:.4f} |".format(phase, running_loss, acc),
+                        end=" ",
+                    )
+
+        # Validation evaluation
+        val_score, val_acc = valid_model_moe(
+            device=device,
+            task=int(task[-2]),
+            dataloader=dataloader[evaluation[-1]],
+            trained_model=model,
+            verbose=False,
+            spike=spike,
+            use_moe=use_moe,
+        )
+
+        val_results = {
+            "score": val_score,
+            "accuracy": val_acc,
+            "loss": 1 / losses[-1],
+        }
+
+        # Track best models for each strategy
+        for item in strategy:
+            if val_results[item] > best_result[item]:
+                best_result[item] = val_results[item]
+                best_dict[item] = {
+                    "epoch": epoch + 1,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                } | val_results
+
+    if verbose == True:
+        print("\nFinished Training  | Time:{}".format(time.time() - start))
+
+    if plot_results == True:
+        plt.figure(figsize=(10, 10))
+        plt.plot(losses[0::2], label="train_loss")
+        if validation == True:
+            plt.plot(losses[1::2], label="validation_loss")
+        plt.legend()
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.draw()
+
+    if save_ckpt:
+        PATH = "ckpts/{}_CheckPoint_task{}.pt".format(model_name, task)
+        torch.save(best_dict, PATH)
+
+    return best_dict
+
+
+def valid_model_moe(device, task, dataloader, trained_model, verbose=False, spike=False, use_moe=False):
+    """
+    Post Evaluation Metric Platform with MoE support.
+    
+    Args:
+        device: either cpu or cuda for acceleration.
+        task: task identifier.
+        dataloader: dataloader containing data for evaluation.
+        trained_model: model used for evaluation.
+        verbose: True to enable verbosity.
+        spike: True to use spiking output.
+        use_moe: True if using MoE classifier.
+    
+    Returns:
+        score: evaluation score from calc_score.
+        accuracy: classification accuracy.
+    """
+    truth = []
+    preds = []
+    
+    for data, label, info in dataloader:
+        data, label, info = data.to(device), label.to(device), info.to(device)
+        x = data
+        
+        if use_moe:
+            # MoE model returns outputs and auxiliary loss
+            outputs, _ = trained_model(x)
+        else:
+            outputs = trained_model(x)
+        
+        if spike:
+            _, idx = outputs[0].sum(dim=0).max(1)
+            preds.append(idx.cpu().numpy().tolist())
+        else:
+            _, predicted = torch.max(outputs, 1)
+            preds.append(predicted.cpu().numpy().tolist())
+        truth.append(label.cpu().numpy().tolist())
+
+    preds_flat = [item for sublist in preds for item in sublist]
+    truth_flat = [item for sublist in truth for item in sublist]
+
+    score, *_ = calc_score(truth_flat, preds_flat, verbose, task=task)
+    accuracy = accuracy_score(truth_flat, preds_flat)
+    
+    if verbose == True:
+        print("\nEvaluating....")
+        print("Accuracy:", accuracy)
+        print(classification_report(truth_flat, preds_flat))
+    
+    return score, accuracy
