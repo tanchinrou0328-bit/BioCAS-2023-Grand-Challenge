@@ -131,7 +131,7 @@ class PRS_classifier2(nn.Module):
         super().__init__()
         if pretrain:
             model_path = os.path.join(opt.save_folder, opt.ckpt)
-            model_info = torch.load(model_path)
+            model_info = torch.load(model_path, weights_only=False)
             self.encoder = mdl.SupConResNet(
                 name=opt.model,
                 head=opt.head,
