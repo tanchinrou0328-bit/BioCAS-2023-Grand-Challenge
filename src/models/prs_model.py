@@ -8,7 +8,7 @@ class PRS_classifier(nn.Module):
         super().__init__()
         if pretrain == True:
             model_path = os.path.join(opt.save_folder, opt.ckpt)
-            model_info = torch.load(model_path)
+            model_info = torch.load(model_path, weights_only=False)
             self.encoder = mdl.SupConResNet(
                 name=opt.model, 
                 head=opt.head, 
