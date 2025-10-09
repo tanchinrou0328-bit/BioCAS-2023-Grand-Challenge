@@ -23,42 +23,75 @@ def test_supcon(SupCon, classifier, testloader, opt):
     return test_score
 
 
+# def test_model(device, task, dataloader, trained_model, verbose=False, spike=False):
+#     """Post Evaluation Metric Platfrom. Feed in the trained model
+#     and train/validation data loader.
+#     Args:
+#         device: either cpu or cuda for acceleration.
+#         dataloader: dataloader containing data for evaluation.
+#         trained_model: model used for evaluation.
+#         verbose: True to enable verbosity (True as default).
+#     Returns:
+#         classification accuracy obtained from sklearn's accuracy score.
+#     """
+#     truth = []
+#     preds = []
+#     trained_model.eval()
+#     for data, label, info in dataloader:
+#         data, label, info = data.to(device), label.to(device), info.to(device)
+#         outputs = trained_model(data)
+#         if spike:
+#             _, idx = outputs[0].sum(dim=0).max(1)
+#             preds.append(idx.cpu().numpy().tolist())
+#         else:
+#             _, predicted = torch.max(outputs, 1)
+#             preds.append(predicted.cpu().numpy().tolist())
+#         truth.append(label.cpu().numpy().tolist())
+
+#     preds_flat = [item for sublist in preds for item in sublist]
+#     truth_flat = [item for sublist in truth for item in sublist]
+
+#     if verbose == True:
+#         print("\nEvaluating....")
+#         print("Accuracy:", accuracy_score(truth_flat, preds_flat))
+#         print(classification_report(truth_flat, preds_flat))
+
+#     score, *_ = calc_score(
+#         truth_flat, preds_flat, verbose, task=task
+#     )
+
+#     # return accuracy_score(truth_flat, preds_flat), truth_flat, preds_flat
+#     return score, truth_flat, preds_flat
+
 def test_model(device, task, dataloader, trained_model, verbose=False, spike=False):
-    """Post Evaluation Metric Platfrom. Feed in the trained model
-    and train/validation data loader.
-    Args:
-        device: either cpu or cuda for acceleration.
-        dataloader: dataloader containing data for evaluation.
-        trained_model: model used for evaluation.
-        verbose: True to enable verbosity (True as default).
-    Returns:
-        classification accuracy obtained from sklearn's accuracy score.
-    """
     truth = []
     preds = []
     trained_model.eval()
+
     for data, label, info in dataloader:
         data, label, info = data.to(device), label.to(device), info.to(device)
+
+        # --- Fix: Unpack MoE output ---
         outputs = trained_model(data)
+        if isinstance(outputs, tuple):  # handle (logits, aux_loss)
+            outputs, _ = outputs  # discard aux_loss during inference
+
         if spike:
             _, idx = outputs[0].sum(dim=0).max(1)
             preds.append(idx.cpu().numpy().tolist())
         else:
             _, predicted = torch.max(outputs, 1)
             preds.append(predicted.cpu().numpy().tolist())
+
         truth.append(label.cpu().numpy().tolist())
 
-    preds_flat = [item for sublist in preds for item in sublist]
-    truth_flat = [item for sublist in truth for item in sublist]
+    preds_flat = [p for batch in preds for p in batch]
+    truth_flat = [t for batch in truth for t in batch]
 
-    if verbose == True:
+    if verbose:
         print("\nEvaluating....")
         print("Accuracy:", accuracy_score(truth_flat, preds_flat))
         print(classification_report(truth_flat, preds_flat))
 
-    score, *_ = calc_score(
-        truth_flat, preds_flat, verbose, task=task
-    )
-
-    # return accuracy_score(truth_flat, preds_flat), truth_flat, preds_flat
+    score, *_ = calc_score(truth_flat, preds_flat, verbose, task=task)
     return score, truth_flat, preds_flat
