@@ -123,7 +123,7 @@ class MoEClassifier(nn.Module):
 
 
     #     return outputs, load_balancing_loss
-    def forward(self, x, return_gates=False):  # ✅ add return_gates flag
+    def forward(self, x, return_gates=False):  # add return_gates flag
         gate_logits = self.gate(x)
         gate_probs = torch.softmax(gate_logits, dim=-1)
         topk_vals, topk_idx = torch.topk(gate_probs, self.k, dim=-1)
@@ -156,7 +156,7 @@ class MoEClassifier(nn.Module):
 # PRS Classifier with MoE
 # --------------------------
 class PRS_classifier2(nn.Module):
-    def __init__(self, opt, num_classes=10, pretrain=True, num_experts=7, hidden_dim=256):
+    def __init__(self, opt, num_classes=10, pretrain=True, num_experts=2, hidden_dim=256):
         super().__init__()
         if pretrain:
             model_path = os.path.join(opt.save_folder, opt.ckpt)
