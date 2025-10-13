@@ -500,122 +500,103 @@ def train_mixup_moe(
     aux_loss_weight=0.01,  # Weight for MoE load-balancing loss
 ):
     """
-    Training function with mixup augmentation and MoE support.
-    
-    Args:
-        device: either cpu or cuda for acceleration.
-        task: task identifier.
-        dataloader: dictionary with 'train' and optionally 'val' dataloaders.
-        model: model to train (can be PRS_classifier or PRS_classifier2 with MoE).
-        criterion: loss function for classification.
-        optimizer: optimizer for training.
-        spike: True to use spiking output (default: False).
-        n_epochs: number of training epochs.
-        print_every: print statistics every N epochs.
-        verbose: True to enable verbosity.
-        plot_results: True to plot training curves.
-        validation: True to perform validation.
-        save_ckpt: True to save checkpoints.
-        model_name: name for saving checkpoint.
-        strategy: list of metrics to track best model ('score', 'accuracy', 'loss').
-        use_moe: True if using MoE classifier (PRS_classifier2).
-        aux_loss_weight: weight for MoE load-balancing auxiliary loss.
-    
-    Returns:
-        best_dict: dictionary containing best model checkpoints for each strategy.
+    Training function with mixup augmentation and MoE support + expert usage visualization.
     """
     best_dict = {}
-    best_result = {}
-    for item in strategy:
-        best_result[item] = 0
+    best_result = {item: 0 for item in strategy}
     losses = []
     start = time.time()
-    print("\nTraining for {} epochs...".format(n_epochs))
-    
+    print(f"\nTraining for {n_epochs} epochs...")
+
+    # ✅ Initialize expert usage counter if using MoE
+    if use_moe:
+        total_expert_usage = torch.zeros(model.classifier.num_experts, device=device)
+
     for epoch in range(n_epochs):
-        if verbose == True and epoch % print_every == 0:
-            print("\n\nEpoch {}/{}:".format(epoch + 1, n_epochs))
+        if verbose and epoch % print_every == 0:
+            print(f"\n\nEpoch {epoch + 1}/{n_epochs}:")
 
-        if validation == True:
-            evaluation = ["train", "val"]
-        else:
-            evaluation = ["train"]
+        evaluation = ["train", "val"] if validation else ["train"]
 
-        # Each epoch has a training and validation phase
         for phase in evaluation:
             total = 0
             correct = 0
             running_loss = 0.0
-            running_aux_loss = 0.0  # Track auxiliary MoE loss separately
-            
+            running_aux_loss = 0.0
+
             if phase == "train":
-                model.train(True)  # Set model to training mode
+                model.train(True)
             else:
-                model.train(False)  # Set model to evaluate mode
-            
+                model.train(False)
+
             for data, label, info in dataloader[phase]:
                 data, label, info = data.to(device), label.to(device), info.to(device)
 
                 # Mix-up method
                 data, label_a, label_b, lam = mixup_data(data, label)
                 data, label_a, label_b = map(Variable, (data, label_a, label_b))
-                
+
+                # --------------------------
                 # Forward pass
-                x = data
+                # --------------------------
                 if use_moe:
-                    # MoE model returns outputs and auxiliary loss
-                    outputs, aux_loss = model(x)
+                    # ✅ Modified: get gating info
+                    outputs, aux_loss, topk_idx = model(x=data, return_gates=True)
+
+                    # ✅ Track expert usage
+                    with torch.no_grad():
+                        for exp_id in range(model.classifier.num_experts):
+                            total_expert_usage[exp_id] += (topk_idx == exp_id).sum().float()
                 else:
-                    # Standard model returns only outputs
-                    outputs = model(x)
+                    outputs = model(data)
                     aux_loss = 0.0
-                
-                # Compute main classification loss with mixup
+
+                # --------------------------
+                # Compute mixup loss + aux loss
+                # --------------------------
                 loss = mixup_criterion(criterion, outputs, label_a, label_b, lam)
-                
-                # Add auxiliary load-balancing loss for MoE
                 if use_moe:
                     total_loss = loss + aux_loss_weight * aux_loss
                     running_aux_loss += aux_loss.item()
                 else:
                     total_loss = loss
-                
-                # Record loss statistics (moved here, only once)
+
                 running_loss += loss.item()
-                
-                # Calculate accuracy with mixup
+
+                # --------------------------
+                # Compute accuracy (mixup-style)
+                # --------------------------
                 _, predicted = torch.max(outputs.data, 1)
                 total += label.size(0)
-                correct += (lam * predicted.eq(label_a.data).cpu().sum().float()
-                    + (1 - lam) * predicted.eq(label_b.data).cpu().sum().float())
-                acc = 1.0 * correct / total
+                correct += (
+                    lam * predicted.eq(label_a.data).cpu().sum().float()
+                    + (1 - lam) * predicted.eq(label_b.data).cpu().sum().float()
+                )
+                acc = correct / total
 
-                # Zero the parameter gradients
                 optimizer.zero_grad()
 
-                # Backward + optimize only if in training phase
                 if phase == "train":
                     total_loss.backward()
-                    # Update the weights
                     optimizer.step()
 
             losses.append(running_loss)
 
-            if verbose == True and epoch % print_every == 0:
+            if verbose and epoch % print_every == 0:
                 if use_moe:
                     print(
-                        "{} loss: {:.4f} | aux_loss: {:.4f} | acc: {:.4f} |".format(
-                            phase, running_loss, running_aux_loss, acc
-                        ),
+                        f"{phase} loss: {running_loss:.4f} | aux_loss: {running_aux_loss:.4f} | acc: {acc:.4f} |",
                         end=" ",
                     )
                 else:
                     print(
-                        "{} loss: {:.4f} | acc: {:.4f} |".format(phase, running_loss, acc),
+                        f"{phase} loss: {running_loss:.4f} | acc: {acc:.4f} |",
                         end=" ",
                     )
 
-        # Validation evaluation
+        # --------------------------
+        # Validation phase
+        # --------------------------
         val_score, val_acc = valid_model_moe(
             device=device,
             task=int(task[-2]),
@@ -632,7 +613,7 @@ def train_mixup_moe(
             "loss": 1 / losses[-1],
         }
 
-        # Track best models for each strategy
+        # Track best model for each strategy
         for item in strategy:
             if val_results[item] > best_result[item]:
                 best_result[item] = val_results[item]
@@ -642,21 +623,49 @@ def train_mixup_moe(
                     "optimizer_state_dict": optimizer.state_dict(),
                 } | val_results
 
-    if verbose == True:
-        print("\nFinished Training  | Time:{}".format(time.time() - start))
+    # --------------------------
+    # Finished Training
+    # --------------------------
+    if verbose:
+        print(f"\nFinished Training  | Time: {time.time() - start:.2f}s")
 
-    if plot_results == True:
-        plt.figure(figsize=(10, 10))
+    # --------------------------
+    # Plot training losses
+    # --------------------------
+    if plot_results:
+        plt.figure(figsize=(10, 6))
         plt.plot(losses[0::2], label="train_loss")
-        if validation == True:
-            plt.plot(losses[1::2], label="validation_loss")
+        if validation:
+            plt.plot(losses[1::2], label="val_loss")
         plt.legend()
         plt.xlabel("Epoch")
         plt.ylabel("Loss")
-        plt.draw()
+        plt.title("Training Curve")
+        plt.show()
 
+    # --------------------------
+    # ✅ Expert usage visualization
+    # --------------------------
+    if use_moe:
+        total_usage = total_expert_usage.cpu().numpy()
+        usage_percent = total_usage / total_usage.sum() * 100
+
+        plt.figure(figsize=(8, 4))
+        plt.bar(range(len(total_usage)), usage_percent, color='skyblue')
+        plt.xlabel("Expert ID")
+        plt.ylabel("Usage (%)")
+        plt.title("Expert Usage Distribution Across Training")
+        plt.show()
+
+        print("\nExpert usage (percent):")
+        for i, p in enumerate(usage_percent):
+            print(f"  Expert {i}: {p:.2f}%")
+
+    # --------------------------
+    # Save best checkpoint (optional)
+    # --------------------------
     if save_ckpt:
-        PATH = "ckpts/{}_CheckPoint_task{}.pt".format(model_name, task)
+        PATH = f"ckpts/{model_name}_CheckPoint_task{task}.pt"
         torch.save(best_dict, PATH)
 
     return best_dict
