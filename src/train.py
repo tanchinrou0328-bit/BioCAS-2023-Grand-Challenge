@@ -509,13 +509,17 @@ def train_mixup_moe(
                         correct_b = predicted.eq(label_b)
                         sample_correct = lam * correct_a.float() + (1 - lam) * correct_b.float()
 
-                        for exp_id in range(model.classifier.num_experts):
-                            mask = (topk_idx == exp_id)
-                            count = mask.sum()
-                            if count > 0:
-                                total_expert_usage[exp_id] += count
-                                expert_correct[exp_id] += sample_correct[mask].sum()
-                                expert_total[exp_id] += count
+                    for exp_id in range(model.classifier.num_experts):
+                        # handle both top-1 and top-k gating shapes
+                        mask = (topk_idx == exp_id)
+                        if mask.dim() > 1:  # e.g., [batch_size, k]
+                            mask = mask.any(dim=1)  # reduce to [batch_size]
+                        count = mask.sum()
+                        if count > 0:
+                            total_expert_usage[exp_id] += count
+                            expert_correct[exp_id] += sample_correct[mask].sum()
+                            expert_total[exp_id] += count
+
                 else:
                     outputs = model(data)
                     aux_loss = 0.0
@@ -649,7 +653,6 @@ def train_mixup_moe(
         torch.save(best_dict, PATH)
 
     return best_dict
-
 
 # def train_mixup_moe(
 #     device,
